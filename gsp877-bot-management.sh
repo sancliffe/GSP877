@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 #
 # GSP877 - Bot Management with Google Cloud Armor and reCAPTCHA
-# End-to-end gcloud automation script (Syntax & Unset Fix)
+# End-to-end gcloud automation script (v6 - Final Resilient Version)
 
 set -euo pipefail
 
 # --------------------------------------------------------------------------
 # 0. Variables & Environment Check
 # --------------------------------------------------------------------------
-export PROJECT_ID=$(gcloud config get-value project)
-export REGION=$(gcloud config get-value compute/region 2>/dev/null || true)
-export ZONE=$(gcloud config get-value compute/zone 2>/dev/null || true)
+# Grab config, but use 'tail -n 1' to filter out multi-line Qwiklabs proxy errors
+export PROJECT_ID=$(gcloud config get-value project 2>/dev/null | tail -n 1)
+export REGION=$(gcloud config get-value compute/region 2>/dev/null | tail -n 1)
+export ZONE=$(gcloud config get-value compute/zone 2>/dev/null | tail -n 1)
 export NETWORK="default"
 
 export TEMPLATE_NAME="lb-backend-template"
@@ -20,9 +21,9 @@ export BACKEND_SERVICE="http-backend"
 export HEALTH_CHECK="http-health-check"
 export SECURITY_POLICY="recaptcha-policy"
 
-# FIX: Safer POSIX conditional that also catches the literal string "(unset)"
-if [ -z "$REGION" ] \vert{}\vert{} [ "$REGION" = "(unset)" ] || [ -z "$ZONE" ] \vert{}\vert{} [ "$ZONE" = "(unset)" ]; then
-    echo "⚠️  Region or Zone not found in gcloud config."
+# Use double brackets [[ ]] which safely handle spaces and multi-line strings
+if [[ -z "$REGION" || "$REGION" == *"(unset)"* || "$REGION" == *"error"* || -z "$ZONE" || "$ZONE" == *"(unset)"* || "$ZONE" == *"error"* ]]; then
+    echo "⚠️  Region or Zone not found automatically due to lab proxy errors."
     read -p "Enter the lab REGION (e.g., europe-west4): " REGION
     read -p "Enter the lab ZONE (e.g., europe-west4-a): " ZONE
     gcloud config set compute/region "$REGION"
@@ -52,7 +53,7 @@ gcloud compute firewall-rules create allow-ssh \
   --target-tags=allow-health-check 2>/dev/null || true
 
 # --------------------------------------------------------------------------
-# Task 2: Instance Template & MIG (Forced Recreation)
+# Task 2: Instance Template & MIG
 # --------------------------------------------------------------------------
 echo ">>> Forcing cleanup of old instance group and template..."
 gcloud compute instance-groups managed delete "${MIG_NAME}" --zone="${ZONE}" --quiet 2>/dev/null || true
@@ -72,7 +73,6 @@ http://metadata.google.internal/computeMetadata/v1/instance/name)"echo "Page ser
 tee /var/www/html/index.html
 EOF
 
-# Create as a GLOBAL template, but explicitly bind it to the regional subnetwork
 gcloud compute instance-templates create "${TEMPLATE_NAME}" \
   --machine-type=e2-medium \
   --network="${NETWORK}" \
@@ -103,4 +103,103 @@ if ! gcloud compute url-maps describe "${LB_NAME}" >/dev/null 2>&1; then
     gcloud compute url-maps create "${LB_NAME}" --default-service="${BACKEND_SERVICE}"
     gcloud compute target-http-proxies create "${LB_NAME}-proxy" --url-map="${LB_NAME}"
     gcloud compute addresses create "${LB_NAME}-ip" --global
-    gcloud compute forwarding-rules create "${LB_NAME}-fw-rule" --address="${LB_NAME}-ip" --
+    gcloud compute forwarding-rules create "${LB_NAME}-fw-rule" --address="${LB_NAME}-ip" --global --target-http-proxy="${LB_NAME}-proxy" --ports=80
+fi
+
+LB_IP=$(gcloud compute addresses describe "${LB_NAME}-ip" --global --format="get(address)")
+echo ">>> Load balancer IPv4 address: ${LB_IP}"
+
+# --------------------------------------------------------------------------
+# Task 4: reCAPTCHA Keys
+# --------------------------------------------------------------------------
+echo ">>> Setting up reCAPTCHA keys..."
+EXISTING_SESSION=$(gcloud recaptcha keys list --format="value(name)" --filter="displayName='test-key-name'" | head -n 1)
+if [ -n "$EXISTING_SESSION" ]; then
+    SESSION_TOKEN_SITE_KEY=$(basename "$EXISTING_SESSION")
+else
+    SESSION_KEY_OUTPUT=$(gcloud recaptcha keys create --display-name=test-key-name --web --allow-all-domains --integration-type=score --testing-score=0.5 --waf-feature=session-token --waf-service=ca --format="value(name)")
+    SESSION_TOKEN_SITE_KEY=$(basename "${SESSION_KEY_OUTPUT}")
+fi
+echo "    SESSION_TOKEN_SITE_KEY = ${SESSION_TOKEN_SITE_KEY}"
+
+EXISTING_CHALLENGE=$(gcloud recaptcha keys list --format="value(name)" --filter="displayName='challenge-page-key'" | head -n 1)
+if [ -n "$EXISTING_CHALLENGE" ]; then
+    CHALLENGE_PAGE_KEY=$(basename "$EXISTING_CHALLENGE")
+else
+    CHALLENGE_KEY_OUTPUT=$(gcloud recaptcha keys create --display-name=challenge-page-key --web --allow-all-domains --integration-type=INVISIBLE --waf-feature=challenge-page --waf-service=ca --format="value(name)")
+    CHALLENGE_PAGE_KEY=$(basename "${CHALLENGE_KEY_OUTPUT}")
+fi
+echo "    CHALLENGE_PAGE_KEY = ${CHALLENGE_PAGE_KEY}"
+
+# --------------------------------------------------------------------------
+# Task 4.2: Push HTML pages
+# --------------------------------------------------------------------------
+echo ">>> Finding exact VM instance name..."
+INSTANCE_NAME=""
+while [ -z "$INSTANCE_NAME" ]; do
+    INSTANCE_NAME=$(gcloud compute instances list --filter="name~'^${MIG_NAME}-.*'" --zones="${ZONE}" --format="value(name)" --limit=1)
+    if [ -z "$INSTANCE_NAME" ]; then
+        echo "    Waiting for VM to provision..."
+        sleep 5
+    fi
+done
+echo "    Found VM: $INSTANCE_NAME"
+
+echo ">>> Waiting for SSH to become available on ${INSTANCE_NAME}..."
+MAX_RETRIES=15
+RETRY_COUNT=0
+until gcloud compute ssh "${INSTANCE_NAME}" --zone "${ZONE}" --command "echo 'SSH Ready'" >/dev/null 2>&1; do
+    RETRY_COUNT=$((RETRY_COUNT+1))
+    if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
+        echo "❌ Failed to connect via SSH after $MAX_RETRIES attempts."
+        exit 1
+    fi
+    echo "    Retrying SSH in 10 seconds... ($RETRY_COUNT/$MAX_RETRIES)"
+    sleep 10
+done
+
+echo ">>> Deploying HTML pages via SSH..."
+gcloud compute ssh "${INSTANCE_NAME}" --zone "${ZONE}" --command "
+sudo bash -c 'cat > /var/www/html/index.html' << HTML
+<!doctype html><html><head><title>ReCAPTCHA Session Token</title><script src=\"https://www.google.com/recaptcha/enterprise.js?render=${SESSION_TOKEN_SITE_KEY}&waf=session\" async defer></script></head><body><h1>Main Page</h1><p><a href=\"/good-score.html\">Visit allowed link</a></p><p><a href=\"/bad-score.html\">Visit blocked link</a></p><p><a href=\"/median-score.html\">Visit redirect link</a></p></body></html>
+HTML
+
+sudo bash -c 'cat > /var/www/html/good-score.html' << 'HTML'
+<!DOCTYPE html><html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=windows-1252\"></head><body><h1>Congrats! You have a good score!!</h1></body></html>
+HTML
+
+sudo bash -c 'cat > /var/www/html/bad-score.html' << 'HTML'
+<!DOCTYPE html><html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=windows-1252\"></head><body><h1>Sorry, You have a bad score!</h1></body></html>
+HTML
+
+sudo bash -c 'cat > /var/www/html/median-score.html' << 'HTML'
+<!DOCTYPE html><html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=windows-1252\"></head><body><h1>You have a median score that we need a second verification.</h1></body></html>
+HTML
+"
+
+# --------------------------------------------------------------------------
+# Task 5: Cloud Armor security policy
+# --------------------------------------------------------------------------
+echo ">>> Configuring Cloud Armor Security Policy..."
+if ! gcloud compute security-policies describe "${SECURITY_POLICY}" >/dev/null 2>&1; then
+    gcloud compute security-policies create "${SECURITY_POLICY}" --description "policy for bot management"
+    gcloud compute security-policies update "${SECURITY_POLICY}" --recaptcha-redirect-site-key "${CHALLENGE_PAGE_KEY}"
+    
+    gcloud compute security-policies rules create 2000 --security-policy "${SECURITY_POLICY}" \
+      --expression "request.path.matches('/good-score.html') && token.recaptcha_session.score > 0.4" --action allow
+      
+    gcloud compute security-policies rules create 3000 --security-policy "${SECURITY_POLICY}" \
+      --expression "request.path.matches('/bad-score.html') && token.recaptcha_session.score < 0.6" --action "deny-403"
+      
+    gcloud compute security-policies rules create 1000 --security-policy "${SECURITY_POLICY}" \
+      --expression "request.path.matches('/median-score.html') && token.recaptcha_session.score == 0.5" \
+      --action redirect --redirect-type google-recaptcha
+
+    gcloud compute backend-services update "${BACKEND_SERVICE}" --security-policy "${SECURITY_POLICY}" --global
+else
+    echo "    Policy ${SECURITY_POLICY} already exists."
+fi
+
+echo "=================================================================="
+echo " ✅ Deployment complete."
+echo "=================================================================="
