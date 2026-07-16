@@ -147,10 +147,17 @@ gcloud compute instance-groups managed wait-until "${MIG_NAME}" \
   --zone "${ZONE}" --stable --timeout=300
 
 INSTANCE_NAME=$(gcloud compute instance-groups managed list-instances "${MIG_NAME}" \
-  --zone "${ZONE}" --format="value(instance)" | head -n1)
+  --zone "${ZONE}" --format="value(instance.basename())" | head -n1)
 
 if [[ -z "${INSTANCE_NAME}" ]]; then
     echo "❌ No instance found in MIG ${MIG_NAME}. Aborting."
+    exit 1
+fi
+
+# Sanity check: fail fast with a clear message instead of burning through
+# 15 blind SSH retries against a bad name.
+if ! gcloud compute instances describe "${INSTANCE_NAME}" --zone "${ZONE}" >/dev/null 2>&1; then
+    echo "❌ '${INSTANCE_NAME}' is not a real instance (got: '${INSTANCE_NAME}'). Aborting."
     exit 1
 fi
 echo "    Found VM: ${INSTANCE_NAME}"
