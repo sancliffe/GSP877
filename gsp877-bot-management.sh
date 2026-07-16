@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # GSP877 - Bot Management with Google Cloud Armor and reCAPTCHA
-# End-to-end gcloud automation script (Force Recreate Fix)
+# End-to-end gcloud automation script (Syntax & Unset Fix)
 
 set -euo pipefail
 
@@ -20,7 +20,8 @@ export BACKEND_SERVICE="http-backend"
 export HEALTH_CHECK="http-health-check"
 export SECURITY_POLICY="recaptcha-policy"
 
-if [[ -z "$REGION" \vert{}\vert{} -z "$ZONE" ]]; then
+# FIX: Safer POSIX conditional that also catches the literal string "(unset)"
+if [ -z "$REGION" ] \vert{}\vert{} [ "$REGION" = "(unset)" ] || [ -z "$ZONE" ] \vert{}\vert{} [ "$ZONE" = "(unset)" ]; then
     echo "⚠️  Region or Zone not found in gcloud config."
     read -p "Enter the lab REGION (e.g., europe-west4): " REGION
     read -p "Enter the lab ZONE (e.g., europe-west4-a): " ZONE
@@ -59,7 +60,6 @@ gcloud compute instance-templates delete "${TEMPLATE_NAME}" --quiet 2>/dev/null 
 gcloud compute instance-templates delete "${TEMPLATE_NAME}" --region="${REGION}" --quiet 2>/dev/null || true
 
 echo ">>> Creating instance template exactly as the grader expects..."
-# Note: The missing newline before 'echo' is intentional to match the lab instructions
 cat > /tmp/startup-script.sh << 'EOF'
 #! /bin/bash
 sudo apt-get update
@@ -103,4 +103,4 @@ if ! gcloud compute url-maps describe "${LB_NAME}" >/dev/null 2>&1; then
     gcloud compute url-maps create "${LB_NAME}" --default-service="${BACKEND_SERVICE}"
     gcloud compute target-http-proxies create "${LB_NAME}-proxy" --url-map="${LB_NAME}"
     gcloud compute addresses create "${LB_NAME}-ip" --global
-    gcloud compute forwarding-rules create "${LB_NAME}-fw-rule" --address="${LB_NAME}-ip"
+    gcloud compute forwarding-rules create "${LB_NAME}-fw-rule" --address="${LB_NAME}-ip" --
