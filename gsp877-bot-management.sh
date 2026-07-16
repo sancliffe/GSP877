@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # GSP877 - Bot Management with Google Cloud Armor and reCAPTCHA
-# End-to-end gcloud automation script (v4 - Grader Optimized)
+# End-to-end gcloud automation script (v5 - Global Template Fix)
 
 set -euo pipefail
 
@@ -51,8 +51,7 @@ gcloud compute firewall-rules create allow-ssh \
   --target-tags=allow-health-check 2>/dev/null || true
 
 echo ">>> Checking instance template..."
-if ! gcloud compute instance-templates describe "${TEMPLATE_NAME}" >/dev/null 2>&1; then
-    # Writing the startup script exactly as expected by the Qwiklabs grader
+if ! gcloud compute instance-templates describe "${TEMPLATE_NAME}" --global >/dev/null 2>&1; then
     cat > /tmp/startup-script.sh << 'EOF'
 #! /bin/bash
 sudo apt-get update
@@ -65,8 +64,9 @@ http://metadata.google.internal/computeMetadata/v1/instance/name)"
 echo "Page served from: $vm_hostname" | \
 tee /var/www/html/index.html
 EOF
+    # FIX: Removed the --region flag so this defaults to a GLOBAL template
     gcloud compute instance-templates create "${TEMPLATE_NAME}" \
-      --machine-type=e2-medium --network="${NETWORK}" --region="${REGION}" \
+      --machine-type=e2-medium --network="${NETWORK}" \
       --tags=allow-health-check --metadata-from-file=startup-script=/tmp/startup-script.sh
 fi
 
