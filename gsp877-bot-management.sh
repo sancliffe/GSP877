@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
 # GSP877 - Bot Management with Google Cloud Armor and reCAPTCHA
-# End-to-end gcloud automation script (v8 - Ultimate Task 4 Fix)
+# End-to-end gcloud automation script (v9 - fixed idempotency + startup script)
 
 set -euo pipefail
+trap 'echo "❌ Script failed at line ${LINENO} (exit code $?)"; exit 1' ERR
 
 # --------------------------------------------------------------------------
 # 0. Variables & Environment Check
@@ -21,7 +22,7 @@ export HEALTH_CHECK="http-health-check"
 export SECURITY_POLICY="recaptcha-policy"
 
 if [[ -z "$REGION" || "$REGION" == *"(unset)"* || "$REGION" == *"error"* || -z "$ZONE" || "$ZONE" == *"(unset)"* || "$ZONE" == *"error"* ]]; then
-    echo "⚠️  Region or Zone not found automatically due to lab proxy errors."
+    echo "⚠️  Region or Zone not found automatically."
     read -p "Enter the lab REGION (e.g., europe-west4): " REGION
     read -p "Enter the lab ZONE (e.g., europe-west4-a): " ZONE
     gcloud config set compute/region "$REGION"
@@ -42,44 +43,52 @@ gcloud compute firewall-rules create default-allow-health-check \
   --direction=INGRESS --priority=1000 --network="${NETWORK}" \
   --action=ALLOW --rules=tcp:80 \
   --source-ranges=130.211.0.0/22,35.191.0.0/16 \
-  --target-tags=allow-health-check 2>/dev/null || true
+  --target-tags=allow-health-check 2>/dev/null || echo "    (default-allow-health-check already exists)"
 
 gcloud compute firewall-rules create allow-ssh \
   --direction=INGRESS --priority=1000 --network="${NETWORK}" \
   --action=ALLOW --rules=tcp:22 \
   --source-ranges=0.0.0.0/0 \
-  --target-tags=allow-health-check 2>/dev/null || true
+  --target-tags=allow-health-check 2>/dev/null || echo "    (allow-ssh already exists)"
 
 # --------------------------------------------------------------------------
 # Task 2: Instance Template & MIG
 # --------------------------------------------------------------------------
-echo ">>> Forcing cleanup of old instance group and template..."
-gcloud compute instance-groups managed delete "${MIG_NAME}" --zone="${ZONE}" --quiet 2>/dev/null || true
-gcloud compute instance-templates delete "${TEMPLATE_NAME}" --quiet 2>/dev/null || true
-
-echo ">>> Creating instance template exactly as the grader expects..."
+# NOTE: deliberately create-if-missing rather than delete-then-recreate.
+# Once the backend service (Task 3) references this MIG, GCP will refuse to
+# delete it — a forced delete silently fails, the "create" step below then
+# hits "already exists" and (correctly) aborts the whole script under
+# `set -e`, which is why Tasks 4-6 never ran previously.
+echo ">>> Writing startup script..."
 cat > /tmp/startup-script.sh << 'EOF'
 #! /bin/bash
 sudo apt-get update
 sudo apt-get install apache2 -y
 sudo a2ensite default-ssl
 sudo a2enmod ssl
-sudo su
-vm_hostname="$(curl -H "Metadata-Flavor:Google" \
-http://metadata.google.internal/computeMetadata/v1/instance/name)"echo "Page served from: $vm_hostname" | \
-tee /var/www/html/index.html
+vm_hostname="$(curl -H "Metadata-Flavor:Google" http://metadata.google.internal/computeMetadata/v1/instance/name)"
+echo "Page served from: $vm_hostname" | sudo tee /var/www/html/index.html
 EOF
 
-gcloud compute instance-templates create "${TEMPLATE_NAME}" \
-  --machine-type=e2-medium \
-  --network="${NETWORK}" \
-  --subnet="projects/${PROJECT_ID}/regions/${REGION}/subnetworks/default" \
-  --tags=allow-health-check \
-  --metadata-from-file=startup-script=/tmp/startup-script.sh
+echo ">>> Checking instance template: ${TEMPLATE_NAME}"
+if gcloud compute instance-templates describe "${TEMPLATE_NAME}" >/dev/null 2>&1; then
+    echo "    Template already exists, skipping creation..."
+else
+    gcloud compute instance-templates create "${TEMPLATE_NAME}" \
+      --machine-type=e2-medium \
+      --network="${NETWORK}" \
+      --subnet="projects/${PROJECT_ID}/regions/${REGION}/subnetworks/default" \
+      --tags=allow-health-check \
+      --metadata-from-file=startup-script=/tmp/startup-script.sh
+fi
 
-echo ">>> Creating managed instance group..."
-gcloud compute instance-groups managed create "${MIG_NAME}" \
-  --template="${TEMPLATE_NAME}" --size=1 --zone="${ZONE}"
+echo ">>> Checking managed instance group: ${MIG_NAME}"
+if gcloud compute instance-groups managed describe "${MIG_NAME}" --zone="${ZONE}" >/dev/null 2>&1; then
+    echo "    MIG already exists, skipping creation..."
+else
+    gcloud compute instance-groups managed create "${MIG_NAME}" \
+      --template="${TEMPLATE_NAME}" --size=1 --zone="${ZONE}"
+fi
 
 gcloud compute instance-groups set-named-ports "${MIG_NAME}" --named-ports http:80 --zone "${ZONE}"
 
@@ -110,7 +119,9 @@ echo ">>> Load balancer IPv4 address: ${LB_IP}"
 # Task 4: reCAPTCHA Keys
 # --------------------------------------------------------------------------
 echo ">>> Setting up reCAPTCHA keys..."
-EXISTING_SESSION=$(gcloud recaptcha keys list --format="value(name)" --filter="displayName='test-key-name'" | head -n 1)
+# NOTE: simple "field=value" filter — no nested quotes, which is the safer
+# form and avoids gcloud filter-parsing edge cases.
+EXISTING_SESSION=$(gcloud recaptcha keys list --format="value(name)" --filter="displayName=test-key-name" | head -n 1)
 if [ -n "$EXISTING_SESSION" ]; then
     SESSION_TOKEN_SITE_KEY=$(basename "$EXISTING_SESSION")
 else
@@ -119,7 +130,7 @@ else
 fi
 echo "    SESSION_TOKEN_SITE_KEY = ${SESSION_TOKEN_SITE_KEY}"
 
-EXISTING_CHALLENGE=$(gcloud recaptcha keys list --format="value(name)" --filter="displayName='challenge-page-key'" | head -n 1)
+EXISTING_CHALLENGE=$(gcloud recaptcha keys list --format="value(name)" --filter="displayName=challenge-page-key" | head -n 1)
 if [ -n "$EXISTING_CHALLENGE" ]; then
     CHALLENGE_PAGE_KEY=$(basename "$EXISTING_CHALLENGE")
 else
@@ -129,23 +140,25 @@ fi
 echo "    CHALLENGE_PAGE_KEY = ${CHALLENGE_PAGE_KEY}"
 
 # --------------------------------------------------------------------------
-# Task 4.2: Push HTML pages (Ultimate Strict Grader Fix)
+# Task 4.2: Push HTML pages
 # --------------------------------------------------------------------------
-echo ">>> Finding exact VM instance name..."
-INSTANCE_NAME=""
-while [ -z "$INSTANCE_NAME" ]; do
-    INSTANCE_NAME=$(gcloud compute instances list --filter="name~'^${MIG_NAME}-.*'" --zones="${ZONE}" --format="value(name)" --limit=1)
-    if [ -z "$INSTANCE_NAME" ]; then
-        echo "    Waiting for VM to provision..."
-        sleep 5
-    fi
-done
-echo "    Found VM: $INSTANCE_NAME"
+echo ">>> Waiting for the managed instance group to stabilize..."
+gcloud compute instance-groups managed wait-until "${MIG_NAME}" \
+  --zone "${ZONE}" --stable --timeout=300
+
+INSTANCE_NAME=$(gcloud compute instance-groups managed list-instances "${MIG_NAME}" \
+  --zone "${ZONE}" --format="value(instance)" | head -n1)
+
+if [[ -z "${INSTANCE_NAME}" ]]; then
+    echo "❌ No instance found in MIG ${MIG_NAME}. Aborting."
+    exit 1
+fi
+echo "    Found VM: ${INSTANCE_NAME}"
 
 echo ">>> Waiting for SSH to become available on ${INSTANCE_NAME}..."
 MAX_RETRIES=15
 RETRY_COUNT=0
-until gcloud compute ssh "${INSTANCE_NAME}" --zone "${ZONE}" --command "echo 'SSH Ready'" >/dev/null 2>&1; do
+until gcloud compute ssh "${INSTANCE_NAME}" --zone "${ZONE}" --quiet --command "echo 'SSH Ready'" >/dev/null 2>&1; do
     RETRY_COUNT=$((RETRY_COUNT+1))
     if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
         echo "❌ Failed to connect via SSH after $MAX_RETRIES attempts."
@@ -155,7 +168,7 @@ until gcloud compute ssh "${INSTANCE_NAME}" --zone "${ZONE}" --command "echo 'SS
     sleep 10
 done
 
-echo ">>> Deploying HTML pages via SSH exactly as expected by grader..."
+echo ">>> Deploying HTML pages via SSH..."
 cat > /tmp/task4.sh <<EOF
 cd /var/www/html/
 
@@ -168,8 +181,9 @@ echo '<!DOCTYPE html><html><head><meta http-equiv="Content-Type" content="text/h
 echo '<!DOCTYPE html><html><head><meta http-equiv="Content-Type" content="text/html; charset=windows-1252"></head><body><h1>You have a median score that we need a second verification.</h1></body></html>' > median-score.html
 EOF
 
-gcloud compute scp /tmp/task4.sh "${INSTANCE_NAME}:/tmp/task4.sh" --zone="${ZONE}"
-gcloud compute ssh "${INSTANCE_NAME}" --zone="${ZONE}" --command="sudo bash /tmp/task4.sh"
+gcloud compute scp --quiet /tmp/task4.sh "${INSTANCE_NAME}:/tmp/task4.sh" --zone="${ZONE}"
+gcloud compute ssh "${INSTANCE_NAME}" --zone="${ZONE}" --quiet --command="sudo bash /tmp/task4.sh"
+echo "    HTML pages deployed successfully."
 
 # --------------------------------------------------------------------------
 # Task 5: Cloud Armor security policy
@@ -178,13 +192,13 @@ echo ">>> Configuring Cloud Armor Security Policy..."
 if ! gcloud compute security-policies describe "${SECURITY_POLICY}" >/dev/null 2>&1; then
     gcloud compute security-policies create "${SECURITY_POLICY}" --description "policy for bot management"
     gcloud compute security-policies update "${SECURITY_POLICY}" --recaptcha-redirect-site-key "${CHALLENGE_PAGE_KEY}"
-    
+
     gcloud compute security-policies rules create 2000 --security-policy "${SECURITY_POLICY}" \
       --expression "request.path.matches('/good-score.html') && token.recaptcha_session.score > 0.4" --action allow
-      
+
     gcloud compute security-policies rules create 3000 --security-policy "${SECURITY_POLICY}" \
       --expression "request.path.matches('/bad-score.html') && token.recaptcha_session.score < 0.6" --action "deny-403"
-      
+
     gcloud compute security-policies rules create 1000 --security-policy "${SECURITY_POLICY}" \
       --expression "request.path.matches('/median-score.html') && token.recaptcha_session.score == 0.5" \
       --action redirect --redirect-type google-recaptcha
@@ -196,5 +210,7 @@ fi
 
 echo "=================================================================="
 echo " ✅ Deployment complete."
-echo " Load Balancer IP: ${LB_IP}"
+echo " Load Balancer IP:          ${LB_IP}"
+echo " Session token site key:    ${SESSION_TOKEN_SITE_KEY}"
+echo " Challenge page site key:   ${CHALLENGE_PAGE_KEY}"
 echo "=================================================================="
